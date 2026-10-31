@@ -1,0 +1,130 @@
+name: Build FanchmWrt TR3000 v1 112MiB
+
+on:
+  push:
+    branches:
+      - build/tr3000-v1-112m
+    paths:
+      - .github/workflows/build-tr3000-112m.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tr3000-v1-112m-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout FanchmWrt source
+        uses: actions/checkout@v4
+        with:
+          ref: build/tr3000-v1-112m
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget curl python3 python3-pip python3-venv \
+            libelf-dev ecj fastjar libxml-parser-perl libusb-1.0-0-dev
+
+      - name: Add requested LuCI applications
+        run: |
+          git clone --depth=1 https://github.com/jerrykuku/luci-app-argon-config package/luci-app-argon-config
+          git clone --depth=1 https://github.com/jerrykuku/luci-theme-argon package/luci-theme-argon
+          git clone --depth=1 https://github.com/lisaac/luci-app-diskman /tmp/luci-app-diskman
+          cp -a /tmp/luci-app-diskman/applications/luci-app-diskman package/luci-app-diskman
+
+      - name: Update and install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure 112MiB UBI layout and firmware
+        run: |
+          set -euxo pipefail
+
+          # The three-partition DHCP U-Boot uses the standard TR3000 v1 image
+          # profile, not the OpenWrt ubootmod FIT/ITB profile.
+          sed -i 's/reg = <0x5c0000 0x4000000>;/reg = <0x5c0000 0x7000000>;/' \
+            target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts
+          sed -i '/define Device\/cudy_tr3000-v1$/,/^endef$/ s/IMAGE_SIZE := 65536k/IMAGE_SIZE := 114688k/' \
+            target/linux/mediatek/image/filogic.mk
+
+          grep -q 'reg = <0x5c0000 0x7000000>;' target/linux/mediatek/dts/mt7981b-cudy-tr3000-v1.dts
+          sed -n '/define Device\/cudy_tr3000-v1$/,/^endef$/p' target/linux/mediatek/image/filogic.mk | grep -q 'IMAGE_SIZE := 114688k'
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-net=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_usbutils=y
+          CONFIG_PACKAGE_luci-theme-argon=y
+          CONFIG_PACKAGE_luci-app-argon-config=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-app-diskman=y
+          EOF
+
+          make defconfig
+
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_cudy_tr3000-v1=y$' .config
+          for pkg in kmod-usb3 kmod-usb-net kmod-usb-net-cdc-ether kmod-usb-net-rndis kmod-usb-net-cdc-ncm usbutils luci-theme-argon luci-app-argon-config luci-app-ttyd luci-app-diskman; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y$" .config || {
+              echo "::error::Required package ${pkg} was not selected by Kconfig"
+              exit 1
+            }
+          done
+
+          echo "=== Target profile ==="
+          grep '^CONFIG_TARGET_mediatek' .config | grep '=y$'
+          echo "=== Required packages ==="
+          grep '^CONFIG_PACKAGE_' .config | grep '=y$' | grep -E 'kmod-usb|usbutils|luci-(app-(argon-config|ttyd|diskman)|theme-argon)'
+
+      - name: Download sources
+        run: make download -j"$(nproc)"
+
+      - name: Compile firmware
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" V=s 2>&1 | tee build.log || {
+            echo "Parallel build failed; retrying serially for a useful diagnostic log."
+            make -j1 V=s 2>&1 | tee build-serial.log
+          }
+
+      - name: Verify firmware image
+        run: |
+          set -euxo pipefail
+          IMAGE="$(find bin/targets/mediatek/filogic -maxdepth 1 -type f -name '*cudy_tr3000-v1*squashfs-sysupgrade.bin' -print -quit)"
+          test -n "$IMAGE"
+          ls -lh "$IMAGE"
+          sha256sum "$IMAGE" | tee firmware.sha256
+          cp "$IMAGE" ./firmware.bin
+          find bin/targets/mediatek/filogic -maxdepth 1 -type f \( -name '*.manifest' -o -name '*.buildinfo' -o -name 'sha256sums' \) -exec cp {} . \; || true
+
+      - name: Upload firmware and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanchmWrt-TR3000-v1-112MiB
+          path: |
+            firmware.bin
+            firmware.sha256
+            *.manifest
+            *.buildinfo
+            sha256sums
+            build.log
+            build-serial.log
+          if-no-files-found: warn
+          compression-level: 0
